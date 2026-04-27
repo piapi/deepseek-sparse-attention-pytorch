@@ -74,7 +74,7 @@ class Indexer(nn.Module):
         self.k_cache[:, start_pos:end_pos] = k
 
     def forward(
-        self, x: torch.Tensor, start_pos: int, end_pos: int, **kwargs
+        self, x: torch.Tensor, start_pos: int, end_pos: int, attention_mask: Optional[torch.Tensor] = None, **kwargs
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
         hidden_shape = (bsz, seqlen, -1, self.head_dim)
@@ -96,15 +96,17 @@ class Indexer(nn.Module):
             weights.unsqueeze(-1) * self.softmax_scale
         )  # (bsz, seqlen, n_heads, 1)
 
-        index_score = fp16_index(q, weights, k)  # (bsz, seqlen, seqlen)
+        index_score = fp16_index(q, weights, k)  # (bsz, seqlen, seqlen_k)
 
-        seqlen_k = index_score.shape[-1]
-        mask = (
-            torch.full((seqlen, seqlen_k), float("-inf"), device=x.device).triu_(1)
-            if seqlen > 1
-            else None
-        )
-        if mask is not None:
+        if attention_mask is not None:
+            if attention_mask.dim() == 4:
+                attention_mask = attention_mask.squeeze(1)
+            index_score = index_score.masked_fill(~attention_mask, float("-inf"))
+        elif seqlen > 1:
+            seqlen_k = index_score.shape[-1]
+            mask = torch.full(
+                (seqlen, seqlen_k), float("-inf"), device=x.device
+            ).triu_(1)
             index_score += mask
 
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
@@ -157,32 +159,23 @@ class Qwen3DSAAttention(Qwen3Attention):
             start_pos, end_pos = key_states.shape[-2] - seqlen, key_states.shape[-2]
 
         topk_indices, index_score = self.indexer(
-            hidden_states, start_pos, end_pos, position_embeddings=position_embeddings, **kwargs
+            hidden_states, start_pos, end_pos, attention_mask=attention_mask, position_embeddings=position_embeddings, **kwargs
         )
 
-        mask_shape = (*input_shape, key_states.shape[-2])
-        index_mask = torch.zeros(
-            mask_shape, dtype=torch.bool, device=hidden_states.device
+        seqlen_q = input_shape[-1]
+        seqlen_k = key_states.shape[-2]
+
+        scatter_src = torch.zeros(
+            topk_indices.shape, dtype=query_states.dtype, device=query_states.device
         )
-        index_mask = index_mask.scatter_(-1, topk_indices, True)
-        index_mask = index_mask.unsqueeze(1)  # (bsz, 1, seqlen_q, seqlen_k)
 
-        if query_states.shape[2] > 1 and attention_mask is None:
-            causal_mask = torch.ones(
-                mask_shape, dtype=torch.bool, device=hidden_states.device
-            ).tril_(0)
-            causal_mask = causal_mask.unsqueeze(1)  # (bsz, 1, seqlen_q, seqlen_k)
-            index_mask = index_mask & causal_mask
-        if attention_mask is not None:
-            index_mask = index_mask & attention_mask
-
-        mask_for_eager = index_mask
-        if self.config._attn_implementation == "eager":
-            mask_for_eager = torch.where(
-                index_mask,
-                torch.tensor(0.0, dtype=query_states.dtype, device=query_states.device),
-                torch.finfo(query_states.dtype).min,
-            )
+        mask_for_eager = torch.full(
+            (input_shape[0], 1, seqlen_q, seqlen_k),
+            torch.finfo(query_states.dtype).min,
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+        mask_for_eager.scatter_(-1, topk_indices.unsqueeze(1), scatter_src.unsqueeze(1))
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -210,6 +203,7 @@ class Qwen3DSAAttention(Qwen3Attention):
                 attention_weights = self.recompute_attention_weights(
                     query_states, key_states, attention_mask, self.scaling
                 )
+            index_mask = mask_for_eager.squeeze(1) == 0.0
             self.index_loss = self.compute_index_loss(
                 index_score, attention_weights, index_mask
             )
