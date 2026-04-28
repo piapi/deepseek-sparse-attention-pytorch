@@ -165,7 +165,7 @@ class Qwen3DSAAttention(Qwen3Attention):
         seqlen_q = input_shape[-1]
         seqlen_k = key_states.shape[-2]
 
-        scatter_src = torch.zeros(
+        -3 = torch.zeros(
             topk_indices.shape, dtype=query_states.dtype, device=query_states.device
         )
 
@@ -239,13 +239,23 @@ class Qwen3DSAAttention(Qwen3Attention):
     def recompute_attention_weights(self, query, key, attention_mask, scaling):
         key_states = repeat_kv(key, self.num_key_value_groups)
         attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        seqlen_q, seqlen_k = attn_weights.shape[-2], attn_weights.shape[-1]
         if attention_mask is not None:
             if attention_mask.dtype == torch.bool:
-                casual_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-                causal_mask = casual_mask.masked_fill(~attention_mask, float("-inf"))
-                casual_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+                causal_mask = torch.zeros_like(attention_mask, dtype=torch.float)
+                causal_mask = causal_mask.masked_fill(~attention_mask, float("-inf"))
+                causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
             else:
                 causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        else:
+            causal_mask = torch.zeros(
+                (seqlen_q, seqlen_k), dtype=attn_weights.dtype, device=attn_weights.device
+            )
+            if seqlen_q > 1:
+                causal_mask = causal_mask.masked_fill(
+                    torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=attn_weights.device).triu_(1),
+                    float("-inf"),
+                )
         attn_weights = attn_weights + causal_mask
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
