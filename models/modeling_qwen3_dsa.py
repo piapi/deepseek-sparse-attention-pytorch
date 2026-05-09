@@ -164,49 +164,106 @@ class Qwen3DSAAttention(Qwen3Attention):
 
         seqlen_q = input_shape[-1]
         seqlen_k = key_states.shape[-2]
+        bsz = query_states.shape[0]
 
-        -3 = torch.zeros(
-            topk_indices.shape, dtype=query_states.dtype, device=query_states.device
-        )
-
-        mask_for_eager = torch.full(
-            (input_shape[0], 1, seqlen_q, seqlen_k),
-            torch.finfo(query_states.dtype).min,
-            dtype=query_states.dtype,
-            device=query_states.device,
-        )
-        mask_for_eager.scatter_(-1, topk_indices.unsqueeze(1), scatter_src.unsqueeze(1))
-
-        attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
+            # 稀疏 KV 选择：用 topk_indices 从 K/V 中 gather 出子集
+            # topk_indices: [B, S_q, topk]，每个 query 位置选 topk 个 key 位置
+            # 策略：将 Q 也按 topk 展开，每个 Q 位置重复 topk 次，一一对应自己选出的 K/V
+            n_kv = key_states.shape[1]
+            n_heads = query_states.shape[1]
+            head_dim = key_states.shape[-1]
+            topk = topk_indices.shape[-1]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            index_mask
-            if self.config._attn_implementation != "eager"
-            else mask_for_eager,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+            # 扩展 topk_indices 到 KV 头维度: [B, S_q, topk] -> [B, N_kv, S_q, topk]
+            sparse_indices_kv = topk_indices.unsqueeze(1).expand(-1, n_kv, -1, -1)
+            # reshape 为 [B, N_kv, S_q*topk] 以便 gather
+            sparse_indices_kv_flat = sparse_indices_kv.reshape(bsz, n_kv, -1)
 
-        if self.training:
-            attention_weights = attn_weights
-            if attention_weights is None:
+            # gather 稀疏 K/V: [B, N_kv, S_k, D] -> [B, N_kv, S_q*topk, D]
+            sparse_key = torch.gather(
+                key_states, 2, sparse_indices_kv_flat.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            )
+            sparse_value = torch.gather(
+                value_states, 2, sparse_indices_kv_flat.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            )
+
+            # GQA: repeat KV heads to match Q heads
+            if n_kv < n_heads:
+                sparse_key = repeat_kv(sparse_key, self.num_key_value_groups)
+                sparse_value = repeat_kv(sparse_value, self.num_key_value_groups)
+
+            # reshape: [B, N_heads, S_q*topk, D] -> [B, N_heads, S_q, topk, D]
+            sparse_key_grouped = sparse_key.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
+            sparse_value_grouped = sparse_value.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
+
+            # Q: [B, N_heads, S_q, D] -> [B, N_heads, S_q, 1, D]
+            # K: [B, N_heads, S_q, topk, D] -> [B, N_heads, S_q, D, topk]
+            # matmul: [B, N_heads, S_q, 1, D] @ [B, N_heads, S_q, D, topk] -> [B, N_heads, S_q, 1, topk]
+            attn_weights_sparse = torch.matmul(
+                query_states.unsqueeze(3),
+                sparse_key_grouped.transpose(-2, -1)
+            ) * self.scaling
+            attn_weights_sparse = F.softmax(attn_weights_sparse, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+            # [B, N_heads, S_q, 1, topk] @ [B, N_heads, S_q, topk, D] -> [B, N_heads, S_q, 1, D]
+            attn_output = torch.matmul(attn_weights_sparse, sparse_value_grouped)
+            attn_output = attn_output.squeeze(3)  # [B, N_heads, S_q, D]
+            attn_weights = None
+
+            if self.training:
                 attention_weights = self.recompute_attention_weights(
                     query_states, key_states, attention_mask, self.scaling
                 )
-            index_mask = mask_for_eager.squeeze(1) == 0.0
-            self.index_loss = self.compute_index_loss(
-                index_score, attention_weights, index_mask
+                scatter_src = torch.zeros(
+                    topk_indices.shape, dtype=query_states.dtype, device=query_states.device
+                )
+                mask_for_eager = torch.full(
+                    (input_shape[0], 1, seqlen_q, seqlen_k),
+                    torch.finfo(query_states.dtype).min,
+                    dtype=query_states.dtype,
+                    device=query_states.device,
+                )
+                mask_for_eager.scatter_(-1, topk_indices.unsqueeze(1), scatter_src.unsqueeze(1))
+                index_mask = mask_for_eager.squeeze(1) == 0.0
+                self.index_loss = self.compute_index_loss(
+                    index_score, attention_weights, index_mask
+                )
+        else:
+            # eager 模式：使用 mask 方式（原有逻辑）
+            scatter_src = torch.zeros(
+                topk_indices.shape, dtype=query_states.dtype, device=query_states.device
             )
+            mask_for_eager = torch.full(
+                (input_shape[0], 1, seqlen_q, seqlen_k),
+                torch.finfo(query_states.dtype).min,
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
+            mask_for_eager.scatter_(-1, topk_indices.unsqueeze(1), scatter_src.unsqueeze(1))
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                mask_for_eager,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+
+            if self.training:
+                attention_weights = attn_weights
+                if attention_weights is None:
+                    attention_weights = self.recompute_attention_weights(
+                        query_states, key_states, attention_mask, self.scaling
+                    )
+                index_mask = mask_for_eager.squeeze(1) == 0.0
+                self.index_loss = self.compute_index_loss(
+                    index_score, attention_weights, index_mask
+                )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
