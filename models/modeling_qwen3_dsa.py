@@ -169,69 +169,78 @@ class Qwen3DSAAttention(Qwen3Attention):
         if self.config._attn_implementation != "eager":
             # 稀疏 KV 选择：用 topk_indices 从 K/V 中 gather 出子集
             # topk_indices: [B, S_q, topk]，每个 query 位置选 topk 个 key 位置
-            # 策略：gather 稀疏 K/V 后，将每个 (batch, query_position) 拆成独立 batch
-            # 调用 FA2/SDPA 做 [1, topk] 的 attention，避免物化大矩阵
+            # 策略：沿 query 维度分块，每块 gather + FA2/SDPA，避免一次性物化大张量
             n_kv = key_states.shape[1]
             n_heads = query_states.shape[1]
             head_dim = key_states.shape[-1]
             topk = topk_indices.shape[-1]
+            use_fa2 = self.config._attn_implementation == "flash_attention_2"
 
-            # 扩展 topk_indices 到 KV 头维度: [B, S_q, topk] -> [B, N_kv, S_q, topk]
-            sparse_indices_kv = topk_indices.unsqueeze(1).expand(-1, n_kv, -1, -1)
-            sparse_indices_kv_flat = sparse_indices_kv.reshape(bsz, n_kv, -1)
+            # 分块处理：每次处理 chunk_size 个 query 位置
+            chunk_size = min(512, seqlen_q)
+            attn_output_chunks = []
 
-            # gather 稀疏 K/V: [B, N_kv, S_k, D] -> [B, N_kv, S_q*topk, D]
-            sparse_key = torch.gather(
-                key_states, 2, sparse_indices_kv_flat.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            )
-            sparse_value = torch.gather(
-                value_states, 2, sparse_indices_kv_flat.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            )
+            for chunk_start in range(0, seqlen_q, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seqlen_q)
+                chunk_len = chunk_end - chunk_start
 
-            # GQA: repeat KV heads to match Q heads
-            if n_kv < n_heads:
-                sparse_key = repeat_kv(sparse_key, self.num_key_value_groups)
-                sparse_value = repeat_kv(sparse_value, self.num_key_value_groups)
+                # Q chunk: [B, N_heads, chunk_len, D]
+                q_chunk = query_states[:, :, chunk_start:chunk_end]
 
-            # reshape: [B, N_heads, S_q*topk, D] -> [B, N_heads, S_q, topk, D]
-            sparse_key = sparse_key.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
-            sparse_value = sparse_value.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
+                # topk_indices chunk: [B, chunk_len, topk]
+                topk_chunk = topk_indices[:, chunk_start:chunk_end]
 
-            # 将每个 (batch, query_position) 拆成独立 batch 元素
-            # Q: [B, N_heads, S_q, D] -> [B*S_q, N_heads, 1, D]
-            # K: [B, N_heads, S_q, topk, D] -> [B*S_q, N_heads, topk, D]
-            # V: [B, N_heads, S_q, topk, D] -> [B*S_q, N_heads, topk, D]
-            # FA2/SDPA 对每个 batch 计算 [1 × topk] attention，无需 mask
-            query_expanded = query_states.transpose(1, 2).reshape(bsz * seqlen_q, n_heads, 1, head_dim)
-            key_expanded = sparse_key.permute(0, 2, 1, 3, 4).reshape(bsz * seqlen_q, n_heads, topk, head_dim)
-            value_expanded = sparse_value.permute(0, 2, 1, 3, 4).reshape(bsz * seqlen_q, n_heads, topk, head_dim)
+                # 扩展到 KV 头维度: [B, chunk_len, topk] -> [B, N_kv, chunk_len, topk]
+                sparse_idx = topk_chunk.unsqueeze(1).expand(-1, n_kv, -1, -1)
+                sparse_idx_flat = sparse_idx.reshape(bsz, n_kv, -1)
 
-            # FA2 输入格式: [batch, seqlen, num_heads, head_dim]
-            query_fa2 = query_expanded.transpose(1, 2)       # [B*S_q, 1, N_heads, D]
-            key_fa2 = key_expanded.transpose(1, 2)           # [B*S_q, topk, N_heads, D]
-            value_fa2 = value_expanded.transpose(1, 2)       # [B*S_q, topk, N_heads, D]
-
-            if self.config._attn_implementation == "flash_attention_2":
-                from flash_attn import flash_attn_func
-                attn_output = flash_attn_func(
-                    query_fa2, key_fa2, value_fa2,
-                    dropout_p=0.0 if not self.training else self.attention_dropout,
-                    softmax_scale=self.scaling,
-                    causal=False,
+                # gather 稀疏 K/V: [B, N_kv, S_k, D] -> [B, N_kv, chunk_len*topk, D]
+                sparse_k = torch.gather(
+                    key_states, 2, sparse_idx_flat.unsqueeze(-1).expand(-1, -1, -1, head_dim)
                 )
-                # [B*S_q, 1, N_heads, D] -> [B*S_q, N_heads, 1, D]
-                attn_output = attn_output.transpose(1, 2)
-            else:
-                # SDPA fallback
-                attn_output = F.scaled_dot_product_attention(
-                    query_expanded, key_expanded, value_expanded,
-                    attn_mask=None,
-                    dropout_p=0.0 if not self.training else self.attention_dropout,
-                    scale=self.scaling,
+                sparse_v = torch.gather(
+                    value_states, 2, sparse_idx_flat.unsqueeze(-1).expand(-1, -1, -1, head_dim)
                 )
 
-            # [B*S_q, N_heads, 1, D] -> [B, S_q, N_heads, D] -> [B, N_heads, S_q, D]
-            attn_output = attn_output.reshape(bsz, seqlen_q, n_heads, head_dim).transpose(1, 2)
+                # GQA: repeat KV heads
+                if n_kv < n_heads:
+                    sparse_k = repeat_kv(sparse_k, self.num_key_value_groups)
+                    sparse_v = repeat_kv(sparse_v, self.num_key_value_groups)
+
+                # reshape: [B, N_heads, chunk_len*topk, D] -> [B, N_heads, chunk_len, topk, D]
+                sparse_k = sparse_k.reshape(bsz, n_heads, chunk_len, topk, head_dim)
+                sparse_v = sparse_v.reshape(bsz, n_heads, chunk_len, topk, head_dim)
+
+                # 拆成独立 batch: 每个 (batch, query_pos) 独立做 [1 × topk] attention
+                # Q: [B, N_heads, chunk_len, D] -> [B*chunk_len, N_heads, 1, D]
+                q_exp = q_chunk.transpose(1, 2).reshape(bsz * chunk_len, n_heads, 1, head_dim)
+                # K: [B, N_heads, chunk_len, topk, D] -> [B*chunk_len, N_heads, topk, D]
+                k_exp = sparse_k.permute(0, 2, 1, 3, 4).reshape(bsz * chunk_len, n_heads, topk, head_dim)
+                v_exp = sparse_v.permute(0, 2, 1, 3, 4).reshape(bsz * chunk_len, n_heads, topk, head_dim)
+
+                if use_fa2:
+                    from flash_attn import flash_attn_func
+                    # FA2 格式: [batch, seqlen, num_heads, head_dim]
+                    out = flash_attn_func(
+                        q_exp.transpose(1, 2), k_exp.transpose(1, 2), v_exp.transpose(1, 2),
+                        dropout_p=0.0 if not self.training else self.attention_dropout,
+                        softmax_scale=self.scaling,
+                        causal=False,
+                    ).transpose(1, 2)
+                else:
+                    out = F.scaled_dot_product_attention(
+                        q_exp, k_exp, v_exp,
+                        attn_mask=None,
+                        dropout_p=0.0 if not self.training else self.attention_dropout,
+                        scale=self.scaling,
+                    )
+
+                # [B*chunk_len, N_heads, 1, D] -> [B, chunk_len, N_heads, D] -> [B, N_heads, chunk_len, D]
+                out = out.reshape(bsz, chunk_len, n_heads, head_dim).transpose(1, 2)
+                attn_output_chunks.append(out)
+
+            # 拼接所有 chunk: [B, N_heads, S_q, D]
+            attn_output = torch.cat(attn_output_chunks, dim=2)
             attn_weights = None
 
             if self.training:

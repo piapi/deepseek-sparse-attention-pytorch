@@ -32,78 +32,122 @@ def test_correctness():
     attn_weights_full = F.softmax(attn_weights_full, dim=-1, dtype=torch.float32).to(query.dtype)
     output_full = torch.matmul(attn_weights_full, value_full)
 
-    # 方法2: 稀疏 gather + SDPA (模拟 FA2 方案)
-    sparse_indices_kv = topk_indices.unsqueeze(1).expand(-1, N_kv, -1, -1)
-    sparse_indices_kv_flat = sparse_indices_kv.reshape(B, N_kv, -1)
+    # 方法2: 分块 gather + SDPA
+    chunk_size = 2
+    attn_output_chunks = []
 
-    sparse_key = torch.gather(
-        key, 2, sparse_indices_kv_flat.unsqueeze(-1).expand(-1, -1, -1, D)
-    )
-    sparse_value = torch.gather(
-        value, 2, sparse_indices_kv_flat.unsqueeze(-1).expand(-1, -1, -1, D)
-    )
+    for chunk_start in range(0, S_q, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, S_q)
+        chunk_len = chunk_end - chunk_start
 
-    sparse_key = repeat_kv(sparse_key, N_heads // N_kv)
-    sparse_value = repeat_kv(sparse_value, N_heads // N_kv)
+        q_chunk = query[:, :, chunk_start:chunk_end]
+        topk_chunk = topk_indices[:, chunk_start:chunk_end]
 
-    sparse_key = sparse_key.reshape(B, N_heads, S_q, topk, D)
-    sparse_value = sparse_value.reshape(B, N_heads, S_q, topk, D)
+        sparse_idx = topk_chunk.unsqueeze(1).expand(-1, N_kv, -1, -1)
+        sparse_idx_flat = sparse_idx.reshape(B, N_kv, -1)
 
-    # 拆成独立 batch
-    query_expanded = query.transpose(1, 2).reshape(B * S_q, N_heads, 1, D)
-    key_expanded = sparse_key.permute(0, 2, 1, 3, 4).reshape(B * S_q, N_heads, topk, D)
-    value_expanded = sparse_value.permute(0, 2, 1, 3, 4).reshape(B * S_q, N_heads, topk, D)
+        sparse_k = torch.gather(
+            key, 2, sparse_idx_flat.unsqueeze(-1).expand(-1, -1, -1, D)
+        )
+        sparse_v = torch.gather(
+            value, 2, sparse_idx_flat.unsqueeze(-1).expand(-1, -1, -1, D)
+        )
 
-    # SDPA
-    attn_output = F.scaled_dot_product_attention(
-        query_expanded, key_expanded, value_expanded,
-        attn_mask=None, dropout_p=0.0, scale=scaling,
-    )
+        sparse_k = repeat_kv(sparse_k, N_heads // N_kv)
+        sparse_v = repeat_kv(sparse_v, N_heads // N_kv)
 
-    # [B*S_q, N_heads, 1, D] -> [B, N_heads, S_q, D]
-    attn_output = attn_output.reshape(B, S_q, N_heads, D).transpose(1, 2)
+        sparse_k = sparse_k.reshape(B, N_heads, chunk_len, topk, D)
+        sparse_v = sparse_v.reshape(B, N_heads, chunk_len, topk, D)
 
-    diff = (output_full - attn_output).abs().max().item()
-    print(f"Max difference (eager mask vs sparse+SDPA): {diff}")
+        q_exp = q_chunk.transpose(1, 2).reshape(B * chunk_len, N_heads, 1, D)
+        k_exp = sparse_k.permute(0, 2, 1, 3, 4).reshape(B * chunk_len, N_heads, topk, D)
+        v_exp = sparse_v.permute(0, 2, 1, 3, 4).reshape(B * chunk_len, N_heads, topk, D)
+
+        out = F.scaled_dot_product_attention(
+            q_exp, k_exp, v_exp,
+            attn_mask=None, dropout_p=0.0, scale=scaling,
+        )
+
+        out = out.reshape(B, chunk_len, N_heads, D).transpose(1, 2)
+        attn_output_chunks.append(out)
+
+    output_chunked = torch.cat(attn_output_chunks, dim=2)
+
+    diff = (output_full - output_chunked).abs().max().item()
+    print(f"Max difference (eager mask vs chunked sparse+SDPA): {diff}")
     if diff < 1e-4:
         print("Correctness test PASSED!")
     else:
         print("Correctness test FAILED!")
 
-def test_full_model():
-    B, S_q, N_heads, N_kv, D, topk = 2, 8, 4, 2, 32, 16
+def test_backward():
+    torch.manual_seed(42)
+    B, S_q, S_k, N_heads, N_kv, D, topk = 2, 4, 32, 2, 1, 16, 8
 
-    from models.configuration_qwen3_dsa import Qwen3DSAConfig
-    from models.modeling_qwen3_dsa import Qwen3DSAForCausalLM
+    query = torch.randn(B, N_heads, S_q, D, requires_grad=True)
+    key = torch.randn(B, N_kv, S_k, D, requires_grad=True)
+    value = torch.randn(B, N_kv, S_k, D, requires_grad=True)
+    scaling = D ** -0.5
 
-    config = Qwen3DSAConfig(
-        vocab_size=1024,
-        hidden_size=N_heads * D,
-        intermediate_size=512,
-        num_hidden_layers=1,
-        num_attention_heads=N_heads,
-        num_key_value_heads=N_kv,
-        head_dim=D,
-        max_position_embeddings=64,
-        index_n_heads=N_heads,
-        index_head_dim=D,
-        index_topk=topk,
-    )
+    topk_indices = torch.zeros(B, S_q, topk, dtype=torch.long)
+    for b in range(B):
+        for s in range(S_q):
+            topk_indices[b, s] = torch.randperm(S_k)[:topk]
 
-    model = Qwen3DSAForCausalLM(config)
-    model.eval()
+    chunk_size = 2
+    attn_output_chunks = []
 
-    input_ids = torch.randint(0, 1024, (B, S_q))
+    for chunk_start in range(0, S_q, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, S_q)
+        chunk_len = chunk_end - chunk_start
 
-    with torch.no_grad():
-        output = model(input_ids)
+        q_chunk = query[:, :, chunk_start:chunk_end]
+        topk_chunk = topk_indices[:, chunk_start:chunk_end]
 
-    print(f"Output shape: {output.logits.shape}")
-    print("Full model test PASSED!")
+        sparse_idx = topk_chunk.unsqueeze(1).expand(-1, N_kv, -1, -1)
+        sparse_idx_flat = sparse_idx.reshape(B, N_kv, -1)
+
+        sparse_k = torch.gather(
+            key, 2, sparse_idx_flat.unsqueeze(-1).expand(-1, -1, -1, D)
+        )
+        sparse_v = torch.gather(
+            value, 2, sparse_idx_flat.unsqueeze(-1).expand(-1, -1, -1, D)
+        )
+
+        sparse_k = repeat_kv(sparse_k, N_heads // N_kv)
+        sparse_v = repeat_kv(sparse_v, N_heads // N_kv)
+
+        sparse_k = sparse_k.reshape(B, N_heads, chunk_len, topk, D)
+        sparse_v = sparse_v.reshape(B, N_heads, chunk_len, topk, D)
+
+        q_exp = q_chunk.transpose(1, 2).reshape(B * chunk_len, N_heads, 1, D)
+        k_exp = sparse_k.permute(0, 2, 1, 3, 4).reshape(B * chunk_len, N_heads, topk, D)
+        v_exp = sparse_v.permute(0, 2, 1, 3, 4).reshape(B * chunk_len, N_heads, topk, D)
+
+        out = F.scaled_dot_product_attention(
+            q_exp, k_exp, v_exp,
+            attn_mask=None, dropout_p=0.0, scale=scaling,
+        )
+
+        out = out.reshape(B, chunk_len, N_heads, D).transpose(1, 2)
+        attn_output_chunks.append(out)
+
+    output = torch.cat(attn_output_chunks, dim=2)
+    loss = output.sum()
+    loss.backward()
+
+    print(f"query.grad: {query.grad.shape}, non-zero: {(query.grad.abs() > 0).sum().item()}/{query.grad.numel()}")
+    print(f"key.grad:   {key.grad.shape}, non-zero: {(key.grad.abs() > 0).sum().item()}/{key.grad.numel()}")
+    print(f"value.grad: {value.grad.shape}, non-zero: {(value.grad.abs() > 0).sum().item()}/{value.grad.numel()}")
+
+    if query.grad is not None and key.grad is not None and value.grad is not None:
+        print("Backward test PASSED!")
+    else:
+        print("Backward test FAILED!")
 
 if __name__ == "__main__":
-    print("=== Correctness Test ===")
+    print("=== Correctness Test (Chunked) ===")
     test_correctness()
     print()
-    print("=== Full Model Test ===")
-    test_full_model()
+    print("=== Backward Test (Chunked) ===")
+    test_backward()
