@@ -169,7 +169,8 @@ class Qwen3DSAAttention(Qwen3Attention):
         if self.config._attn_implementation != "eager":
             # 稀疏 KV 选择：用 topk_indices 从 K/V 中 gather 出子集
             # topk_indices: [B, S_q, topk]，每个 query 位置选 topk 个 key 位置
-            # 策略：将 Q 也按 topk 展开，每个 Q 位置重复 topk 次，一一对应自己选出的 K/V
+            # 策略：gather 稀疏 K/V 后，将每个 (batch, query_position) 拆成独立 batch
+            # 调用 FA2/SDPA 做 [1, topk] 的 attention，避免物化大矩阵
             n_kv = key_states.shape[1]
             n_heads = query_states.shape[1]
             head_dim = key_states.shape[-1]
@@ -177,7 +178,6 @@ class Qwen3DSAAttention(Qwen3Attention):
 
             # 扩展 topk_indices 到 KV 头维度: [B, S_q, topk] -> [B, N_kv, S_q, topk]
             sparse_indices_kv = topk_indices.unsqueeze(1).expand(-1, n_kv, -1, -1)
-            # reshape 为 [B, N_kv, S_q*topk] 以便 gather
             sparse_indices_kv_flat = sparse_indices_kv.reshape(bsz, n_kv, -1)
 
             # gather 稀疏 K/V: [B, N_kv, S_k, D] -> [B, N_kv, S_q*topk, D]
@@ -194,21 +194,44 @@ class Qwen3DSAAttention(Qwen3Attention):
                 sparse_value = repeat_kv(sparse_value, self.num_key_value_groups)
 
             # reshape: [B, N_heads, S_q*topk, D] -> [B, N_heads, S_q, topk, D]
-            sparse_key_grouped = sparse_key.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
-            sparse_value_grouped = sparse_value.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
+            sparse_key = sparse_key.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
+            sparse_value = sparse_value.reshape(bsz, n_heads, seqlen_q, topk, head_dim)
 
-            # Q: [B, N_heads, S_q, D] -> [B, N_heads, S_q, 1, D]
-            # K: [B, N_heads, S_q, topk, D] -> [B, N_heads, S_q, D, topk]
-            # matmul: [B, N_heads, S_q, 1, D] @ [B, N_heads, S_q, D, topk] -> [B, N_heads, S_q, 1, topk]
-            attn_weights_sparse = torch.matmul(
-                query_states.unsqueeze(3),
-                sparse_key_grouped.transpose(-2, -1)
-            ) * self.scaling
-            attn_weights_sparse = F.softmax(attn_weights_sparse, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            # 将每个 (batch, query_position) 拆成独立 batch 元素
+            # Q: [B, N_heads, S_q, D] -> [B*S_q, N_heads, 1, D]
+            # K: [B, N_heads, S_q, topk, D] -> [B*S_q, N_heads, topk, D]
+            # V: [B, N_heads, S_q, topk, D] -> [B*S_q, N_heads, topk, D]
+            # FA2/SDPA 对每个 batch 计算 [1 × topk] attention，无需 mask
+            query_expanded = query_states.transpose(1, 2).reshape(bsz * seqlen_q, n_heads, 1, head_dim)
+            key_expanded = sparse_key.permute(0, 2, 1, 3, 4).reshape(bsz * seqlen_q, n_heads, topk, head_dim)
+            value_expanded = sparse_value.permute(0, 2, 1, 3, 4).reshape(bsz * seqlen_q, n_heads, topk, head_dim)
 
-            # [B, N_heads, S_q, 1, topk] @ [B, N_heads, S_q, topk, D] -> [B, N_heads, S_q, 1, D]
-            attn_output = torch.matmul(attn_weights_sparse, sparse_value_grouped)
-            attn_output = attn_output.squeeze(3)  # [B, N_heads, S_q, D]
+            # FA2 输入格式: [batch, seqlen, num_heads, head_dim]
+            query_fa2 = query_expanded.transpose(1, 2)       # [B*S_q, 1, N_heads, D]
+            key_fa2 = key_expanded.transpose(1, 2)           # [B*S_q, topk, N_heads, D]
+            value_fa2 = value_expanded.transpose(1, 2)       # [B*S_q, topk, N_heads, D]
+
+            if self.config._attn_implementation == "flash_attention_2":
+                from flash_attn import flash_attn_func
+                attn_output = flash_attn_func(
+                    query_fa2, key_fa2, value_fa2,
+                    dropout_p=0.0 if not self.training else self.attention_dropout,
+                    softmax_scale=self.scaling,
+                    causal=False,
+                )
+                # [B*S_q, 1, N_heads, D] -> [B*S_q, N_heads, 1, D]
+                attn_output = attn_output.transpose(1, 2)
+            else:
+                # SDPA fallback
+                attn_output = F.scaled_dot_product_attention(
+                    query_expanded, key_expanded, value_expanded,
+                    attn_mask=None,
+                    dropout_p=0.0 if not self.training else self.attention_dropout,
+                    scale=self.scaling,
+                )
+
+            # [B*S_q, N_heads, 1, D] -> [B, S_q, N_heads, D] -> [B, N_heads, S_q, D]
+            attn_output = attn_output.reshape(bsz, seqlen_q, n_heads, head_dim).transpose(1, 2)
             attn_weights = None
 
             if self.training:
