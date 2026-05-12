@@ -3,6 +3,7 @@ from typing import Callable, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers import AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -155,9 +156,10 @@ class Qwen3DSAAttention(Qwen3Attention):
             )
             start_pos, end_pos = key_states.shape[-2] - seqlen, key_states.shape[-2]
 
-        topk_indices, index_score = self.indexer(
-            hidden_states, start_pos, end_pos, position_embeddings=position_embeddings, **kwargs
-        )
+        with torch.no_grad():
+            topk_indices, _ = self.indexer(
+                hidden_states, start_pos, end_pos, position_embeddings=position_embeddings, **kwargs
+            )
 
         mask_shape = (*input_shape, key_states.shape[-2])
         index_mask = torch.zeros(
@@ -204,17 +206,63 @@ class Qwen3DSAAttention(Qwen3Attention):
         )
 
         if self.training:
-            attention_weights = attn_weights
-            if attention_weights is None:
-                attention_weights = self.recompute_attention_weights(
-                    query_states, key_states, attention_mask, self.scaling
-                )
-            self.index_loss = self.compute_index_loss(
-                index_score, attention_weights, index_mask
+            self.index_loss = torch.utils.checkpoint.checkpoint(
+                self._sparse_indexer_and_loss,
+                hidden_states,
+                start_pos,
+                end_pos,
+                query_states,
+                key_states,
+                attention_mask,
+                self.scaling,
+                cos,
+                sin,
+                use_reentrant=False,
             )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+    def _sparse_indexer_and_loss(
+        self,
+        hidden_states: torch.Tensor,
+        start_pos: int,
+        end_pos: int,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_indices, index_score = self.indexer(
+            hidden_states, start_pos, end_pos,
+            position_embeddings=(cos, sin),
+            use_cache=False,
+        )
+
+        kv_seqlen = key_states.shape[-2]
+        input_shape = hidden_states.shape[:-1]
+        mask_shape = (*input_shape, kv_seqlen)
+        index_mask = torch.zeros(
+            mask_shape, dtype=torch.bool, device=hidden_states.device
+        )
+        index_mask = index_mask.scatter_(-1, topk_indices, True)
+        index_mask = index_mask.unsqueeze(1)
+
+        if query_states.shape[2] > 1 and attention_mask is None:
+            causal_mask = torch.ones(
+                mask_shape, dtype=torch.bool, device=hidden_states.device
+            ).tril_(0)
+            causal_mask = causal_mask.unsqueeze(1)
+            index_mask = index_mask & causal_mask
+        if attention_mask is not None:
+            index_mask = index_mask & attention_mask
+
+        attention_weights = self.recompute_attention_weights(
+            query_states, key_states, attention_mask, scaling
+        )
+        return self.compute_index_loss(index_score, attention_weights, index_mask)
 
     def compute_index_loss(
         self,
