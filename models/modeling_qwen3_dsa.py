@@ -217,7 +217,7 @@ class Qwen3DSAAttention(Qwen3Attention):
                 self.scaling,
                 cos,
                 sin,
-                use_reentrant=False,
+                use_reentrant=True,
             )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
