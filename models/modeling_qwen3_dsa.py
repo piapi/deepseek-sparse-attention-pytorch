@@ -76,6 +76,8 @@ class Indexer(nn.Module):
     def forward(
         self, x: torch.Tensor, start_pos: int, end_pos: int, **kwargs
     ) -> torch.Tensor:
+        if hasattr(x, "to_local"):
+            x = x.to_local()
         bsz, seqlen, _ = x.shape
         hidden_shape = (bsz, seqlen, -1, self.head_dim)
         q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
@@ -83,6 +85,10 @@ class Indexer(nn.Module):
 
         position_embeddings = kwargs["position_embeddings"]
         cos, sin = position_embeddings
+        if hasattr(cos, "to_local"):
+            cos = cos.to_local()
+        if hasattr(sin, "to_local"):
+            sin = sin.to_local()
         q, k = apply_rotary_pos_emb(q, k, cos, sin)  # (bsz, n_heads, seqlen, head_dim)
         q = q.transpose(1, 2)  # (bsz, seqlen, n_heads, head_dim)
         k = k.transpose(1, 2).squeeze(2)  # (bsz, seqlen, head_dim)
@@ -270,6 +276,13 @@ class Qwen3DSAAttention(Qwen3Attention):
         attention_weights: torch.Tensor,
         index_mask: torch.Tensor | None,
     ):
+        if hasattr(index_score, "to_local"):
+            index_score = index_score.to_local()
+        if hasattr(attention_weights, "to_local"):
+            attention_weights = attention_weights.to_local()
+        if index_mask is not None and hasattr(index_mask, "to_local"):
+            index_mask = index_mask.to_local()
+
         if attention_weights.dim() == 4:
             attention_weights = attention_weights.sum(1)
 
@@ -306,6 +319,13 @@ class Qwen3DSAAttention(Qwen3Attention):
         return total_kl / B
 
     def recompute_attention_weights(self, query, key, attention_mask, scaling):
+        if hasattr(query, "to_local"):
+            query = query.to_local()
+        if hasattr(key, "to_local"):
+            key = key.to_local()
+        if hasattr(attention_mask, "to_local"):
+            attention_mask = attention_mask.to_local()
+
         G = self.num_key_value_groups
         H_KV = key.shape[1]
         B, H_Q, S_q, D = query.shape
