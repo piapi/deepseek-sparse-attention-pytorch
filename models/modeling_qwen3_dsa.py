@@ -245,28 +245,38 @@ class Qwen3DSAAttention(Qwen3Attention):
             score_chunk = index_score[:, s_start:s_end, :]
 
             if self.indexer_full_kl:
-                valid_mask = score_chunk > -1e8
-                score_chunk = score_chunk.clamp(min=-1e9, max=1e9)
+                valid_mask = attn_chunk.sum(dim=-1) > 0
+                score_chunk = score_chunk.masked_fill(~valid_mask.unsqueeze(-1), float("-inf"))
                 attn_chunk = attn_chunk + eps
                 attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
                 log_index_dist = F.log_softmax(score_chunk, dim=-1)
                 kl_element = F.kl_div(
                     log_index_dist, attn_dist, reduction="none", log_target=False
                 )
-                kl_element = kl_element.masked_fill(~valid_mask, 0.0)
+                kl_element = kl_element.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
                 total_kl += kl_element.sum()
             else:
                 topk_chunk = topk_indices[:, s_start:s_end]
-                score_topk = score_chunk.gather(-1, topk_chunk)
-                attn_topk = attn_chunk.gather(-1, topk_chunk)
+                Bc, Cc, Kc = topk_chunk.shape
+                Sk = score_chunk.shape[-1]
 
-                attn_topk = attn_topk + eps
-                attn_dist = attn_topk / attn_topk.sum(dim=-1, keepdim=True).clamp_min(eps)
-                log_index_dist = F.log_softmax(score_topk, dim=-1)
-
-                total_kl += F.kl_div(
-                    log_index_dist, attn_dist, reduction="sum", log_target=False
+                index_mask_chunk = torch.zeros(
+                    Bc, Cc, Sk, dtype=torch.bool, device=score_chunk.device
                 )
+                index_mask_chunk = index_mask_chunk.scatter_(-1, topk_chunk, True)
+
+                score_chunk = score_chunk.masked_fill(~index_mask_chunk, float("-inf"))
+                attn_chunk = attn_chunk.masked_fill(~index_mask_chunk, 0.0)
+
+                attn_chunk = attn_chunk + eps
+                attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
+                log_index_dist = F.log_softmax(score_chunk, dim=-1)
+
+                kl_element = F.kl_div(
+                    log_index_dist, attn_dist, reduction="none", log_target=False
+                )
+                kl_element = kl_element.masked_fill(~index_mask_chunk, 0.0)
+                total_kl += kl_element.sum()
 
         return total_kl / B
 
@@ -323,28 +333,38 @@ class Qwen3DSAAttention(Qwen3Attention):
                 attn_chunk += weights_h.sum(dim=1)
 
             if self.indexer_full_kl:
-                valid_mask = score_chunk > -1e8
-                score_chunk = score_chunk.clamp(min=-1e9, max=1e9)
+                valid_mask = attn_chunk.sum(dim=-1) > 0
+                score_chunk = score_chunk.masked_fill(~valid_mask.unsqueeze(-1), float("-inf"))
                 attn_chunk = attn_chunk + eps
                 attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
                 log_index_dist = F.log_softmax(score_chunk, dim=-1)
                 kl_element = F.kl_div(
                     log_index_dist, attn_dist, reduction="none", log_target=False
                 )
-                kl_element = kl_element.masked_fill(~valid_mask, 0.0)
+                kl_element = kl_element.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
                 total_kl += kl_element.sum()
             else:
                 topk_chunk = topk_indices[:, s_start:s_end]
-                attn_topk = attn_chunk.gather(-1, topk_chunk)
-                score_topk = score_chunk.gather(-1, topk_chunk)
+                Bc, Cc, Kc = topk_chunk.shape
+                Sk = score_chunk.shape[-1]
 
-                attn_topk = attn_topk + eps
-                attn_dist = attn_topk / attn_topk.sum(dim=-1, keepdim=True).clamp_min(eps)
-                log_index_dist = F.log_softmax(score_topk, dim=-1)
-
-                total_kl += F.kl_div(
-                    log_index_dist, attn_dist, reduction="sum", log_target=False
+                index_mask_chunk = torch.zeros(
+                    Bc, Cc, Sk, dtype=torch.bool, device=score_chunk.device
                 )
+                index_mask_chunk = index_mask_chunk.scatter_(-1, topk_chunk, True)
+
+                score_chunk = score_chunk.masked_fill(~index_mask_chunk, float("-inf"))
+                attn_chunk = attn_chunk.masked_fill(~index_mask_chunk, 0.0)
+
+                attn_chunk = attn_chunk + eps
+                attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
+                log_index_dist = F.log_softmax(score_chunk, dim=-1)
+
+                kl_element = F.kl_div(
+                    log_index_dist, attn_dist, reduction="none", log_target=False
+                )
+                kl_element = kl_element.masked_fill(~index_mask_chunk, 0.0)
+                total_kl += kl_element.sum()
 
         return total_kl / B
 

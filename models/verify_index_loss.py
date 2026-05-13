@@ -369,47 +369,83 @@ def full_kl_compute_index_loss(index_score, attention_weights):
         attn_chunk = attention_weights[:, s_start:s_end, :]
         score_chunk = index_score[:, s_start:s_end, :]
 
-        valid_mask = score_chunk > -1e8
-        score_chunk = score_chunk.clamp(min=-1e9, max=1e9)
+        valid_mask = attn_chunk.sum(dim=-1) > 0
+        score_chunk = score_chunk.masked_fill(~valid_mask.unsqueeze(-1), float("-inf"))
         attn_chunk = attn_chunk + eps
         attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
         log_index_dist = F.log_softmax(score_chunk, dim=-1)
         kl_element = F.kl_div(
             log_index_dist, attn_dist, reduction="none", log_target=False
         )
-        kl_element = kl_element.masked_fill(~valid_mask, 0.0)
+        kl_element = kl_element.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
         total_kl += kl_element.sum()
 
     return total_kl / B
 
 
-def test_7_warmup_auto_switch():
+def test_7_mask_vs_gather():
     print("=" * 60)
-    print("Test 7: Warmup auto-switch (property-based)")
+    print("Test 7: Mask-based topk KL (no gather, no 1e9 issue)")
     print("=" * 60)
 
-    query, key, scaling, attention_mask, index_score, topk_indices, index_mask, G = make_data(S_q=128, S_kv=128)
-    old_weights = old_recompute_attention_weights(query, key, attention_mask, scaling, G)
+    for S in [64, 128, 256]:
+        query, key, scaling, attention_mask, index_score, topk_indices, index_mask, G = make_data(S_q=S, S_kv=S)
+        old_weights = old_recompute_attention_weights(query, key, attention_mask, scaling, G)
 
-    class MockAttention:
-        def __init__(self, warmup_steps):
-            self.indexer_warmup_steps = warmup_steps
-            self._indexer_training_step = 0
+        gather_loss = new_compute_index_loss(
+            index_score.clone(), old_weights.clone(), topk_indices.clone()
+        )
 
-        @property
-        def indexer_full_kl(self):
-            return self._indexer_training_step < self.indexer_warmup_steps
+        mask_loss = mask_compute_index_loss(
+            index_score.clone(), old_weights.clone(), topk_indices.clone()
+        )
 
-    attn = MockAttention(warmup_steps=100)
+        print(f"  S={S:4d}: gather_loss={gather_loss.item():.6f}, mask_loss={mask_loss.item():.6f}, "
+              f"diff={abs(gather_loss.item() - mask_loss.item()):.6f}")
 
-    for step in [0, 50, 99, 100, 200]:
-        attn._indexer_training_step = step
-        mode = "full_kl" if attn.indexer_full_kl else "topk"
-        print(f"  step={step:4d}: indexer_full_kl={attn.indexer_full_kl} → {mode} mode")
-
-    print("  NOTE: step < warmup_steps → full KL (cold start safe)")
-    print("        step >= warmup_steps → topk KL (efficient)")
+    print("  NOTE: mask version uses -inf (not -1e9), safe for softmax.")
     print()
+
+
+def mask_compute_index_loss(index_score, attention_weights, topk_indices):
+    if attention_weights.dim() == 4:
+        attention_weights = attention_weights.sum(1)
+
+    eps = 1e-8
+    B, S_q, S_kv = attention_weights.shape
+    CHUNK_SIZE = 128
+
+    total_kl = torch.tensor(0.0, device=attention_weights.device, dtype=torch.float32)
+
+    for s_start in range(0, S_q, CHUNK_SIZE):
+        s_end = min(s_start + CHUNK_SIZE, S_q)
+
+        attn_chunk = attention_weights[:, s_start:s_end, :]
+        score_chunk = index_score[:, s_start:s_end, :]
+        topk_chunk = topk_indices[:, s_start:s_end]
+
+        Bc, Cc, Kc = topk_chunk.shape
+        Sk = score_chunk.shape[-1]
+
+        index_mask_chunk = torch.zeros(
+            Bc, Cc, Sk, dtype=torch.bool, device=score_chunk.device
+        )
+        index_mask_chunk = index_mask_chunk.scatter_(-1, topk_chunk, True)
+
+        score_chunk = score_chunk.masked_fill(~index_mask_chunk, float("-inf"))
+        attn_chunk = attn_chunk.masked_fill(~index_mask_chunk, 0.0)
+
+        attn_chunk = attn_chunk + eps
+        attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
+        log_index_dist = F.log_softmax(score_chunk, dim=-1)
+
+        kl_element = F.kl_div(
+            log_index_dist, attn_dist, reduction="none", log_target=False
+        )
+        kl_element = kl_element.masked_fill(~index_mask_chunk, 0.0)
+        total_kl += kl_element.sum()
+
+    return total_kl / B
 
 
 if __name__ == "__main__":
@@ -419,4 +455,4 @@ if __name__ == "__main__":
     test_4_kl_on_topk_only()
     test_5_gradient_flow()
     test_6_full_kl_mode()
-    test_7_warmup_auto_switch()
+    test_7_mask_vs_gather()
