@@ -3,7 +3,6 @@ from typing import Callable, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from transformers import AutoConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -26,6 +25,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
     apply_rotary_pos_emb,
     eager_attention_forward,
+    repeat_kv,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -76,8 +76,6 @@ class Indexer(nn.Module):
     def forward(
         self, x: torch.Tensor, start_pos: int, end_pos: int, **kwargs
     ) -> torch.Tensor:
-        if hasattr(x, "to_local"):
-            x = x.to_local()
         bsz, seqlen, _ = x.shape
         hidden_shape = (bsz, seqlen, -1, self.head_dim)
         q = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
@@ -85,10 +83,6 @@ class Indexer(nn.Module):
 
         position_embeddings = kwargs["position_embeddings"]
         cos, sin = position_embeddings
-        if hasattr(cos, "to_local"):
-            cos = cos.to_local()
-        if hasattr(sin, "to_local"):
-            sin = sin.to_local()
         q, k = apply_rotary_pos_emb(q, k, cos, sin)  # (bsz, n_heads, seqlen, head_dim)
         q = q.transpose(1, 2)  # (bsz, seqlen, n_heads, head_dim)
         k = k.transpose(1, 2).squeeze(2)  # (bsz, seqlen, head_dim)
@@ -162,10 +156,9 @@ class Qwen3DSAAttention(Qwen3Attention):
             )
             start_pos, end_pos = key_states.shape[-2] - seqlen, key_states.shape[-2]
 
-        with torch.no_grad():
-            topk_indices, _ = self.indexer(
-                hidden_states, start_pos, end_pos, position_embeddings=position_embeddings, **kwargs
-            )
+        topk_indices, index_score = self.indexer(
+            hidden_states, start_pos, end_pos, position_embeddings=position_embeddings, **kwargs
+        )
 
         mask_shape = (*input_shape, key_states.shape[-2])
         index_mask = torch.zeros(
@@ -212,86 +205,30 @@ class Qwen3DSAAttention(Qwen3Attention):
         )
 
         if self.training:
-            self.index_loss = torch.utils.checkpoint.checkpoint(
-                self._sparse_indexer_and_loss,
-                hidden_states,
-                start_pos,
-                end_pos,
-                query_states,
-                key_states,
-                attention_mask,
-                self.scaling,
-                cos,
-                sin,
-                use_reentrant=True,
+            attention_weights = attn_weights
+            if attention_weights is None:
+                attention_weights = self.recompute_attention_weights(
+                    query_states, key_states, attention_mask, self.scaling
+                )
+            self.index_loss = self.compute_index_loss(
+                index_score, attention_weights, topk_indices
             )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    def _sparse_indexer_and_loss(
-        self,
-        hidden_states: torch.Tensor,
-        start_pos: int,
-        end_pos: int,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        scaling: float,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        topk_indices, index_score = self.indexer(
-            hidden_states, start_pos, end_pos,
-            position_embeddings=(cos, sin),
-            use_cache=False,
-        )
-
-        kv_seqlen = key_states.shape[-2]
-        input_shape = hidden_states.shape[:-1]
-        mask_shape = (*input_shape, kv_seqlen)
-        index_mask = torch.zeros(
-            mask_shape, dtype=torch.bool, device=hidden_states.device
-        )
-        index_mask = index_mask.scatter_(-1, topk_indices, True)
-        index_mask = index_mask.unsqueeze(1)
-
-        if query_states.shape[2] > 1 and attention_mask is None:
-            causal_mask = torch.ones(
-                mask_shape, dtype=torch.bool, device=hidden_states.device
-            ).tril_(0)
-            causal_mask = causal_mask.unsqueeze(1)
-            index_mask = index_mask & causal_mask
-        if attention_mask is not None:
-            index_mask = index_mask & attention_mask
-
-        attention_weights = self.recompute_attention_weights(
-            query_states, key_states, attention_mask, scaling
-        )
-        return self.compute_index_loss(index_score, attention_weights, index_mask)
-
     def compute_index_loss(
         self,
         index_score: torch.Tensor,
         attention_weights: torch.Tensor,
-        index_mask: torch.Tensor | None,
+        topk_indices: torch.Tensor,
     ):
-        if hasattr(index_score, "to_local"):
-            index_score = index_score.to_local()
-        if hasattr(attention_weights, "to_local"):
-            attention_weights = attention_weights.to_local()
-        if index_mask is not None and hasattr(index_mask, "to_local"):
-            index_mask = index_mask.to_local()
-
         if attention_weights.dim() == 4:
             attention_weights = attention_weights.sum(1)
 
         eps = 1e-8
         B, S_q, S_kv = attention_weights.shape
         CHUNK_SIZE = 128
-
-        if index_mask is not None:
-            index_mask = index_mask.squeeze(1)
 
         total_kl = torch.tensor(0.0, device=attention_weights.device, dtype=torch.float32)
 
@@ -300,17 +237,14 @@ class Qwen3DSAAttention(Qwen3Attention):
 
             attn_chunk = attention_weights[:, s_start:s_end, :]
             score_chunk = index_score[:, s_start:s_end, :]
+            topk_chunk = topk_indices[:, s_start:s_end]
 
-            if index_mask is not None:
-                mask_chunk = index_mask[:, s_start:s_end, :]
-                attn_chunk = attn_chunk.masked_fill(~mask_chunk, eps)
-                score_chunk = score_chunk.masked_fill(~mask_chunk, -1e9)
+            score_topk = score_chunk.gather(-1, topk_chunk)
+            attn_topk = attn_chunk.gather(-1, topk_chunk)
 
-            score_chunk = torch.clamp(score_chunk, min=-1e9, max=1e9)
-            attn_dist = attn_chunk / attn_chunk.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(eps)
-            log_index_dist = F.log_softmax(score_chunk, dim=-1)
+            attn_topk = attn_topk + eps
+            attn_dist = attn_topk / attn_topk.sum(dim=-1, keepdim=True).clamp_min(eps)
+            log_index_dist = F.log_softmax(score_topk, dim=-1)
 
             total_kl += F.kl_div(
                 log_index_dist, attn_dist, reduction="sum", log_target=False
@@ -319,53 +253,21 @@ class Qwen3DSAAttention(Qwen3Attention):
         return total_kl / B
 
     def recompute_attention_weights(self, query, key, attention_mask, scaling):
-        if hasattr(query, "to_local"):
-            query = query.to_local()
-        if hasattr(key, "to_local"):
-            key = key.to_local()
-        if hasattr(attention_mask, "to_local"):
-            attention_mask = attention_mask.to_local()
-
-        G = self.num_key_value_groups
-        H_KV = key.shape[1]
-        B, H_Q, S_q, D = query.shape
-        S_kv = key.shape[2]
-
-        CHUNK_SIZE = 128
-
+        key_states = repeat_kv(key, self.num_key_value_groups)
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
         if attention_mask is not None:
             if attention_mask.dtype == torch.bool:
-                causal_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-                causal_mask = causal_mask.masked_fill(~attention_mask, float("-inf"))
-                causal_mask = causal_mask[:, :, :, :S_kv]
+                casual_mask = torch.zeros_like(attention_mask, dtype=torch.float)
+                causal_mask = casual_mask.masked_fill(~attention_mask, float("-inf"))
+                casual_mask = causal_mask[:, :, :, : key_states.shape[-2]]
             else:
-                causal_mask = attention_mask[:, :, :, :S_kv]
-        else:
-            causal_mask = None
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query.dtype)
 
-        query_reshaped = query.view(B, H_KV, G, S_q, D)
-        attn_weights_sum = torch.zeros(B, S_q, S_kv, dtype=torch.float32, device=query.device)
-
-        for s_start in range(0, S_q, CHUNK_SIZE):
-            s_end = min(s_start + CHUNK_SIZE, S_q)
-            chunk_len = s_end - s_start
-            chunk_weights = torch.zeros(B, chunk_len, S_kv, dtype=torch.float32, device=query.device)
-
-            for h in range(H_KV):
-                q_group = query_reshaped[:, h, :, s_start:s_end]
-                k_h = key[:, h:h+1]
-
-                weights_h = torch.matmul(q_group, k_h.transpose(2, 3)) * scaling
-
-                if causal_mask is not None:
-                    weights_h = weights_h + causal_mask[:, :, s_start:s_end]
-
-                weights_h = F.softmax(weights_h, dim=-1, dtype=torch.float32)
-                chunk_weights += weights_h.sum(dim=1)
-
-            attn_weights_sum[:, s_start:s_end] = chunk_weights
-
-        return attn_weights_sum.unsqueeze(1).to(query.dtype)
+        return attn_weights
 
 
 class Qwen3DSAModel(Qwen3Model):
@@ -524,3 +426,5 @@ class Qwen3DSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
