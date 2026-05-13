@@ -11,6 +11,7 @@ class Qwen3DSAConfig(Qwen3Config):
         index_n_heads: int = 64,
         index_head_dim: int = 128,
         index_topk: int = 2048,
+        indexer_warmup_steps: int = 1000,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -20,3 +21,4 @@ class Qwen3DSAConfig(Qwen3Config):
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
+        self.indexer_warmup_steps = indexer_warmup_steps

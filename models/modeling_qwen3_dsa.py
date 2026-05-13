@@ -25,7 +25,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
     apply_rotary_pos_emb,
     eager_attention_forward,
-    repeat_kv,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -119,6 +118,12 @@ class Qwen3DSAAttention(Qwen3Attention):
         super().__init__(config, layer_idx)
         self.indexer = Indexer(config)
         self.index_loss = 0
+        self.indexer_warmup_steps = config.indexer_warmup_steps
+        self._indexer_training_step = 0
+
+    @property
+    def indexer_full_kl(self):
+        return self._indexer_training_step < self.indexer_warmup_steps
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -205,14 +210,15 @@ class Qwen3DSAAttention(Qwen3Attention):
         )
 
         if self.training:
-            attention_weights = attn_weights
-            if attention_weights is None:
-                attention_weights = self.recompute_attention_weights(
-                    query_states, key_states, attention_mask, self.scaling
+            if attn_weights is not None:
+                self.index_loss = self.compute_index_loss(
+                    index_score, attn_weights, topk_indices
                 )
-            self.index_loss = self.compute_index_loss(
-                index_score, attention_weights, topk_indices
-            )
+            else:
+                self.index_loss = self._compute_index_loss_from_scratch(
+                    index_score, query_states, key_states,
+                    attention_mask, self.scaling, topk_indices
+                )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -237,37 +243,110 @@ class Qwen3DSAAttention(Qwen3Attention):
 
             attn_chunk = attention_weights[:, s_start:s_end, :]
             score_chunk = index_score[:, s_start:s_end, :]
-            topk_chunk = topk_indices[:, s_start:s_end]
 
-            score_topk = score_chunk.gather(-1, topk_chunk)
-            attn_topk = attn_chunk.gather(-1, topk_chunk)
+            if self.indexer_full_kl:
+                valid_mask = score_chunk > -1e8
+                score_chunk = score_chunk.clamp(min=-1e9, max=1e9)
+                attn_chunk = attn_chunk + eps
+                attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
+                log_index_dist = F.log_softmax(score_chunk, dim=-1)
+                kl_element = F.kl_div(
+                    log_index_dist, attn_dist, reduction="none", log_target=False
+                )
+                kl_element = kl_element.masked_fill(~valid_mask, 0.0)
+                total_kl += kl_element.sum()
+            else:
+                topk_chunk = topk_indices[:, s_start:s_end]
+                score_topk = score_chunk.gather(-1, topk_chunk)
+                attn_topk = attn_chunk.gather(-1, topk_chunk)
 
-            attn_topk = attn_topk + eps
-            attn_dist = attn_topk / attn_topk.sum(dim=-1, keepdim=True).clamp_min(eps)
-            log_index_dist = F.log_softmax(score_topk, dim=-1)
+                attn_topk = attn_topk + eps
+                attn_dist = attn_topk / attn_topk.sum(dim=-1, keepdim=True).clamp_min(eps)
+                log_index_dist = F.log_softmax(score_topk, dim=-1)
 
-            total_kl += F.kl_div(
-                log_index_dist, attn_dist, reduction="sum", log_target=False
-            )
+                total_kl += F.kl_div(
+                    log_index_dist, attn_dist, reduction="sum", log_target=False
+                )
 
         return total_kl / B
 
-    def recompute_attention_weights(self, query, key, attention_mask, scaling):
-        key_states = repeat_kv(key, self.num_key_value_groups)
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    def _compute_index_loss_from_scratch(
+        self,
+        index_score: torch.Tensor,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        scaling: float,
+        topk_indices: torch.Tensor,
+    ):
+        G = self.num_key_value_groups
+        H_KV = key_states.shape[1]
+        B, H_Q, S_q, D = query_states.shape
+        S_kv = key_states.shape[2]
+
+        eps = 1e-8
+        CHUNK_SIZE = 128
+        total_kl = torch.tensor(0.0, device=query_states.device, dtype=torch.float32)
+
+        query_reshaped = query_states.view(B, H_KV, G, S_q, D)
+
         if attention_mask is not None:
             if attention_mask.dtype == torch.bool:
-                casual_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-                causal_mask = casual_mask.masked_fill(~attention_mask, float("-inf"))
-                casual_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+                causal_mask = torch.zeros_like(attention_mask, dtype=torch.float)
+                causal_mask = causal_mask.masked_fill(~attention_mask, float("-inf"))
             else:
-                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query.dtype)
+                causal_mask = attention_mask
 
-        return attn_weights
+        for s_start in range(0, S_q, CHUNK_SIZE):
+            s_end = min(s_start + CHUNK_SIZE, S_q)
+            chunk_len = s_end - s_start
+
+            score_chunk = index_score[:, s_start:s_end, :]
+
+            attn_chunk = torch.zeros(
+                B, chunk_len, S_kv, dtype=torch.float32, device=query_states.device
+            )
+
+            for h in range(H_KV):
+                q_group = query_reshaped[:, h, :, s_start:s_end]
+                k_h = key_states[:, h:h+1]
+
+                weights_h = torch.matmul(
+                    q_group, k_h.transpose(2, 3)
+                ) * scaling
+
+                if attention_mask is not None:
+                    mask_chunk = causal_mask[:, :, s_start:s_end, :S_kv]
+                    weights_h = weights_h + mask_chunk
+
+                weights_h = F.softmax(weights_h, dim=-1, dtype=torch.float32)
+                attn_chunk += weights_h.sum(dim=1)
+
+            if self.indexer_full_kl:
+                valid_mask = score_chunk > -1e8
+                score_chunk = score_chunk.clamp(min=-1e9, max=1e9)
+                attn_chunk = attn_chunk + eps
+                attn_dist = attn_chunk / attn_chunk.sum(dim=-1, keepdim=True).clamp_min(eps)
+                log_index_dist = F.log_softmax(score_chunk, dim=-1)
+                kl_element = F.kl_div(
+                    log_index_dist, attn_dist, reduction="none", log_target=False
+                )
+                kl_element = kl_element.masked_fill(~valid_mask, 0.0)
+                total_kl += kl_element.sum()
+            else:
+                topk_chunk = topk_indices[:, s_start:s_end]
+                attn_topk = attn_chunk.gather(-1, topk_chunk)
+                score_topk = score_chunk.gather(-1, topk_chunk)
+
+                attn_topk = attn_topk + eps
+                attn_dist = attn_topk / attn_topk.sum(dim=-1, keepdim=True).clamp_min(eps)
+                log_index_dist = F.log_softmax(score_topk, dim=-1)
+
+                total_kl += F.kl_div(
+                    log_index_dist, attn_dist, reduction="sum", log_target=False
+                )
+
+        return total_kl / B
 
 
 class Qwen3DSAModel(Qwen3Model):
@@ -278,6 +357,10 @@ class Qwen3DSAModel(Qwen3Model):
             old_attn = layer.self_attn
             new_attn = Qwen3DSAAttention(config, layer_idx=old_attn.layer_idx)
             layer.self_attn = new_attn
+
+    def set_indexer_training_step(self, step: int):
+        for layer in self.layers:
+            layer.self_attn._indexer_training_step = step
 
     def forward(
         self,
@@ -371,6 +454,9 @@ class Qwen3DSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.post_init()
         if not hasattr(config, "sparse_lambda"):
             config.sparse_lambda = 0.01
+
+    def set_indexer_training_step(self, step: int):
+        self.model.set_indexer_training_step(step)
 
     def forward(
         self,
